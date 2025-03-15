@@ -31,14 +31,6 @@ from tqdm import tqdm
 
 MB = 1024 * 1024
 GB = 1024 * MB
-
-logger.remove()
-logger.add(
-    "flanker.log",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-    level="DEBUG"
-)
-
 class ProgressPercentage:
     """
     Callback for boto3's s3 upload operations to show progress with tqdm.
@@ -91,6 +83,7 @@ def parse_arguments():
     parser.add_argument("--key", required=True,  help="Object key (path) in the S3 bucket.")
     parser.add_argument("--region", default="us-east-1", help="AWS region (default: us-east-1).")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging.")
+    parser.add_argument("--logfolder", "-l", default="/resource/heapdump", help="Folder to keep log file.")
     return parser.parse_args()
 
 def handle_sigint(sig, _):
@@ -101,6 +94,13 @@ def handle_sigint(sig, _):
 def main():
     args = parse_arguments()
 
+    logger.remove()
+    logger.add(
+        f"{args.logfolder}/flanker.log",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+        level="DEBUG"
+    )
+
     if args.verbose:
         logger.add(
             sys.stderr,
@@ -109,6 +109,8 @@ def main():
             level="DEBUG"
         )
         logger.debug("Verbose logging enabled")
+
+    logger.info(f"--- Starting flanker...(logging to {args.logfolder}/flanker.log)")
 
     signal.signal(signal.SIGINT, handle_sigint)
 
