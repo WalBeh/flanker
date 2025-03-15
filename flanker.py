@@ -22,7 +22,9 @@ import argparse
 import os
 import sys
 import signal
+import datetime
 import boto3
+import hashlib
 from boto3.s3.transfer import TransferConfig
 from loguru import logger
 from tqdm import tqdm
@@ -32,10 +34,9 @@ GB = 1024 * MB
 
 logger.remove()
 logger.add(
-    sys.stderr,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> "
-           "| <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    level="INFO"
+    "flanker.log",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+    level="DEBUG"
 )
 
 class ProgressPercentage:
@@ -59,6 +60,30 @@ class ProgressPercentage:
         if self._seen_so_far >= self._size:
             self._pbar.close()
 
+def verify_upload_integrity(file_path, etag):
+    """Verify the integrity of an uploaded file by comparing its MD5 hash with the S3 ETag."""
+    # Strip quotes from ETag if present
+    etag = etag.strip('"')
+
+    # Check if it's a multipart ETag (contains a dash)
+    if '-' in etag:
+        logger.info("Multipart upload detected. Simple MD5 verification not possible.")
+        return None
+
+    # Calculate MD5 hash of the local file
+    md5_hash = hashlib.md5()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(4096), b''):
+            md5_hash.update(chunk)
+
+    local_md5 = md5_hash.hexdigest()
+
+    # Compare hashes
+    if local_md5 == etag:
+        return True
+    else:
+        return False
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Upload a file to S3 using boto3 with multi-part support (>5GB).")
     parser.add_argument("file_path", help="Local path to the file to upload.")
@@ -77,7 +102,6 @@ def main():
     args = parse_arguments()
 
     if args.verbose:
-        logger.remove()
         logger.add(
             sys.stderr,
             format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> "
@@ -92,6 +116,11 @@ def main():
     if not os.path.isfile(file_path):
         logger.error(f"File not found: {file_path}")
         return 1
+
+    file_size = os.path.getsize(file_path)
+    file_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(file_path))
+    size_str = f"{file_size / MB:.2f} MB" if file_size < GB else f"{file_size / GB:.2f} GB"
+    logger.info(f"File: {os.path.basename(file_path)}, Size: {size_str}, Modified: {file_mtime.strftime('%Y-%m-%d %H:%M:%S')}")
 
     s3 = boto3.client("s3", region_name=args.region)
 
@@ -110,6 +139,7 @@ def main():
 
     # Run the upload
     try:
+        start_time = datetime.datetime.now()
         s3.upload_file(
             Filename=file_path,
             Bucket=args.bucket,
@@ -117,8 +147,38 @@ def main():
             Config=transfer_config,
             Callback=progress_callback
         )
-        logger.success("Upload completed successfully.")
+        end_time = datetime.datetime.now()
+        elapsed_time = end_time - start_time
+        elapsed_seconds = elapsed_time.total_seconds()
+
+        # Get object metadata to confirm upload
+        object_info = s3.head_object(Bucket=args.bucket, Key=args.key)
+
+        # Calculate and display statistics
+        file_size_bytes = os.path.getsize(file_path)
+        upload_speed_mbps = (file_size_bytes / (1024 * 1024)) / elapsed_seconds if elapsed_seconds > 0 else 0
+
+        logger.success(f"Upload completed successfully in {elapsed_time}")
+        logger.info(f"Average upload speed: {upload_speed_mbps:.2f} MB/s")
+        logger.info(f"S3 object: s3://{args.bucket}/{args.key}")
+        logger.info(f"ETag: {object_info.get('ETag', 'N/A')}")
+        logger.info(f"Storage class: {object_info.get('StorageClass', 'STANDARD')}")
+
+        etag = object_info.get('ETag', 'N/A').strip('"')
+        logger.info(f"ETag: \"{etag}\"")
+
+        # Verify integrity if not a multipart upload
+        if '-' not in etag:
+            is_valid = verify_upload_integrity(file_path, etag)
+            if is_valid:
+                logger.success("File integrity verified: Local MD5 matches S3 ETag")
+            else:
+                logger.warning("File integrity check failed: Local MD5 doesn't match S3 ETag")
+        else:
+            logger.warning("Multipart upload detected - skipping simple integrity check")
+
         return 0
+
     except Exception as e:
         logger.error(f"Upload failed: {e}")
         return 1
